@@ -137,11 +137,7 @@ let memoryAdmins = [
   { username: 'iqbal', password: hashPassword('Iqbal@Secure123') }
 ];
 
-let memoryLocations = [
-  { name: 'London Central', postcode: 'EC1A 1BB' },
-  { name: 'Manchester Piccadilly', postcode: 'M1 1FF' },
-  { name: 'Birmingham New Street', postcode: 'B2 4ND' }
-];
+
 let memoryAttendance = [];
 let memoryHourlyUpdates = [];
 let memoryInventoryReports = [];
