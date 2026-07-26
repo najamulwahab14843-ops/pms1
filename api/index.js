@@ -25,9 +25,9 @@ function verifyPassword(password, storedValue) {
 }
 
 const DEFAULT_ADMINS = [
-  { username: 'Sasha', password: 'Sasha@Secure123' },
-  { username: 'Najam', password: 'NAJAMS@Secure123' },
-  { username: 'Viktorija', password: 'Viktorija@Secure123' }
+  { username: 'najam', password: 'Najam@Secure123' },
+  { username: 'sasha', password: 'Sasha@Secure123' },
+  { username: 'viktorijia', password: 'Viktorijia@Secure123' }
 ];
 
 const app = express();
@@ -134,9 +134,9 @@ if (isMongo) {
 
 // In-Memory Data Store (Fallback)
 let memoryAdmins = [
-  { username: 'minha', password: hashPassword('Minha@Secure123') },
-  { username: 'azam', password: hashPassword('Azam@Secure123') },
-  { username: 'iqbal', password: hashPassword('Iqbal@Secure123') }
+  { username: 'najam', password: hashPassword('Najam@Secure123') },
+  { username: 'sasha', password: hashPassword('Sasha@Secure123') },
+  { username: 'viktorijia', password: hashPassword('Viktorijia@Secure123') }
 ];
 
 // Starts EMPTY — no fixed/default locations. Only locations added via
