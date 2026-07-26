@@ -227,7 +227,7 @@ async function addAttendance(doc) {
 
 async function updateAttendance(query, updateDoc) {
   if (hasMongoConnection()) {
-    return await Attendance.updateOne(query, updateDoc);
+    return await Attendance.updateOne(query, { $set: updateDoc });
   } else {
     // Find active checkin for promoter today (which would match the query: checkoutTs: null)
     const record = memoryAttendance.slice().reverse().find(item => {
@@ -335,8 +335,8 @@ function todayStr() {
   return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
 }
 
-async function compileLocationState(locationName) {
-  const today = todayStr();
+async function compileLocationState(locationName, clientDate) {
+  const today = clientDate || todayStr();
   const attendance = await getAttendance({ location: locationName });
   const hourlyUpdates = await getHourlyUpdates({ location: locationName });
   const inventoryReports = await getInventoryReports({ location: locationName });
@@ -437,13 +437,13 @@ app.post('/api/locations', async (req, res) => {
 
 // Check-in
 app.post('/api/checkin', async (req, res) => {
-  const { location, name } = req.body;
+  const { location, name, date } = req.body;
   if (!location || !name) {
     return res.status(400).json({ error: 'Location and name are required.' });
   }
   try {
     const now = Date.now();
-    const today = todayStr();
+    const today = date || todayStr();
     await addAttendance({
       location,
       name,
@@ -465,9 +465,8 @@ app.post('/api/checkout', async (req, res) => {
   }
   try {
     const now = Date.now();
-    const today = todayStr();
     await updateAttendance(
-      { location, name, date: today, checkoutTs: null },
+      { location, name, checkoutTs: null },
       { checkoutTs: now }
     );
     res.json({ success: true });
@@ -524,12 +523,12 @@ app.post('/api/inventory', async (req, res) => {
 
 // End of Day (EOD)
 app.post('/api/eod', async (req, res) => {
-  const { location, promoter, sales, samples, inventory, flavours, summary, feedback } = req.body;
+  const { location, promoter, sales, samples, inventory, flavours, summary, feedback, date } = req.body;
   if (!location || !promoter) {
     return res.status(400).json({ error: 'Location and promoter are required.' });
   }
   try {
-    const today = todayStr();
+    const today = date || todayStr();
     await saveEodReport(
       { location, promoter, date: today },
       {
@@ -567,10 +566,11 @@ app.get('/api/state', authenticateToken, async (req, res) => {
     const locations = await getLocations();
     const postcodes = {};
     const data = {};
+    const clientDate = req.query.today;
 
     for (let loc of locations) {
       postcodes[loc.name] = loc.postcode || '';
-      data[loc.name] = await compileLocationState(loc.name);
+      data[loc.name] = await compileLocationState(loc.name, clientDate);
     }
 
     res.json({
@@ -586,12 +586,12 @@ app.get('/api/state', authenticateToken, async (req, res) => {
 
 // Promoter Portal State
 app.get('/api/promoter-state', async (req, res) => {
-  const { location } = req.query;
+  const { location, today } = req.query;
   if (!location) {
     return res.status(400).json({ error: 'Location query parameter is required.' });
   }
   try {
-    const data = await compileLocationState(location);
+    const data = await compileLocationState(location, today);
     res.json({ data });
   } catch (err) {
     res.status(500).json({ error: 'Failed to load promoter state.' });

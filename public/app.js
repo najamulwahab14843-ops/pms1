@@ -10,8 +10,8 @@ async function api(path, opts) {
   return res.json();
 }
 const authHeader = () => (authToken ? { 'x-auth-token': authToken } : {});
-const getManagerState = () => api('/state', { headers: authHeader() });
-const getPromoterState = (location) => api('/promoter-state?location=' + encodeURIComponent(location));
+const getManagerState = () => api('/state?today=' + encodeURIComponent(todayStr()), { headers: authHeader() });
+const getPromoterState = (location) => api('/promoter-state?location=' + encodeURIComponent(location) + '&today=' + encodeURIComponent(todayStr()));
 
 /* ============================= UTIL ============================= */
 function esc(s){ return (s===undefined||s===null?'':String(s)).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
@@ -465,6 +465,33 @@ document.getElementById('endSessionBtn').onclick = ()=>{
 /* Shows the FULL history of today's sessions for this promoter (not just the
    most recent one), so checking in a second time no longer hides the first
    check-in/check-out times. */
+async function handleCheckinClick(btn) {
+  btn.disabled = true;
+  btn.style.background = 'var(--danger)';
+  btn.style.color = '#fff';
+  btn.style.borderColor = 'var(--danger)';
+  btn.textContent = 'Checking in...';
+  try {
+    await api('/checkin', { method:'POST', body: JSON.stringify({ location: session.location, name: session.name, date: todayStr() }) });
+    showToast('Checked in — visible on manager dashboard');
+  } catch (err) {
+    showToast('Check-in failed: ' + err.message);
+  }
+  await renderCheckinBox();
+}
+
+async function handleCheckoutClick(btn) {
+  btn.disabled = true;
+  btn.textContent = 'Checking out...';
+  try {
+    await api('/checkout', { method:'POST', body: JSON.stringify({ location: session.location, name: session.name }) });
+    showToast('Checked out');
+  } catch (err) {
+    showToast('Check-out failed: ' + err.message);
+  }
+  await renderCheckinBox();
+}
+
 async function renderCheckinBox(){
   const state = await getPromoterState(session.location);
   const d = state.data;
@@ -494,11 +521,7 @@ async function renderCheckinBox(){
       </div>
       ${historyHtml}
     </div>`;
-    document.getElementById('doCheckoutBtn').onclick = async ()=>{
-      await api('/checkout', { method:'POST', body: JSON.stringify({ location: session.location, name: session.name }) });
-      showToast('Checked out');
-      renderCheckinBox();
-    };
+    document.getElementById('doCheckoutBtn').onclick = (e) => handleCheckoutClick(e.currentTarget);
   } else if(mySessions.length){
     box.innerHTML = `<div class="panel" style="padding:16px 22px;">
       <div style="display:flex;justify-content:space-between;align-items:center;">
@@ -507,21 +530,13 @@ async function renderCheckinBox(){
       </div>
       ${historyHtml}
     </div>`;
-    document.getElementById('doCheckinBtn').onclick = async ()=>{
-      await api('/checkin', { method:'POST', body: JSON.stringify({ location: session.location, name: session.name }) });
-      showToast('Checked in — visible on manager dashboard');
-      renderCheckinBox();
-    };
+    document.getElementById('doCheckinBtn').onclick = (e) => handleCheckinClick(e.currentTarget);
   } else {
     box.innerHTML = `<div class="panel" style="display:flex;justify-content:space-between;align-items:center;padding:16px 22px;">
       <div><h3 style="margin:0;">You haven't checked in yet</h3><p class="sub" style="margin:4px 0 0;">Tap the button to mark your arrival.</p></div>
       <button class="btn btn-primary" id="doCheckinBtn">Check In Now</button>
     </div>`;
-    document.getElementById('doCheckinBtn').onclick = async ()=>{
-      await api('/checkin', { method:'POST', body: JSON.stringify({ location: session.location, name: session.name }) });
-      showToast('Checked in — visible on manager dashboard');
-      renderCheckinBox();
-    };
+    document.getElementById('doCheckinBtn').onclick = (e) => handleCheckinClick(e.currentTarget);
   }
 }
 
@@ -652,6 +667,7 @@ document.getElementById('submitInventoryBtn').onclick = async ()=>{
 document.getElementById('submitEodBtn').onclick = async ()=>{
   const payload = {
     location: session.location, promoter: session.name,
+    date: todayStr(),
     sales: document.getElementById('e_sales').value || 0,
     samples: document.getElementById('e_samples').value || 0,
     inventory: document.getElementById('e_inventory').value,
