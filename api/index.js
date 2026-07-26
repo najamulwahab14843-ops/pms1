@@ -52,7 +52,9 @@ if (isMongo) {
   mongoose.connect(MONGODB_URI)
     .then(() => {
       console.log('Connected to MongoDB successfully.');
-      seedDefaultLocations();
+      // NOTE: seedDefaultLocations() intentionally NOT called.
+      // No fixed/default locations are seeded — only locations added
+      // via POST /api/locations will ever appear.
       seedDefaultAdmins();
     })
     .catch(err => {
@@ -137,25 +139,14 @@ let memoryAdmins = [
   { username: 'iqbal', password: hashPassword('Iqbal@Secure123') }
 ];
 
+// Starts EMPTY — no fixed/default locations. Only locations added via
+// POST /api/locations will ever appear here.
+let memoryLocations = [];
 
 let memoryAttendance = [];
 let memoryHourlyUpdates = [];
 let memoryInventoryReports = [];
 let memoryEodReports = [];
-
-// Seed default locations for MongoDB if database is empty
-async function seedDefaultLocations() {
-  try {
-    const count = await Location.countDocuments({});
-    if (count === 0) {
-      console.log('Seeding default locations...');
-      await Location.insertMany(memoryLocations);
-      console.log('Default locations seeded.');
-    }
-  } catch (err) {
-    console.error('Failed to seed locations:', err);
-  }
-}
 
 // Seed default admins for MongoDB if database is empty
 async function seedDefaultAdmins() {
