@@ -38,7 +38,7 @@ function showToast(msg){
 }
 
 /* ============================= SESSION (in-memory only) ============================= */
-let session = null; // {name, location}
+let session = null;
 let currentTab = 'hourly';
 let hourlyLow = null;
 let invLow = null;
@@ -100,7 +100,7 @@ document.getElementById('logoutBtn').onclick = async ()=>{
   renderManager();
 };
 
-/* ============================= MANAGER TABS (Overview / Attendance / Sales Report) ============================= */
+/* ============================= MANAGER TABS ============================= */
 document.querySelectorAll('#mgrTabs .tab-btn').forEach(btn=>{
   btn.onclick = ()=>{
     document.querySelectorAll('#mgrTabs .tab-btn').forEach(b=>b.classList.remove('active'));
@@ -110,7 +110,7 @@ document.querySelectorAll('#mgrTabs .tab-btn').forEach(btn=>{
   };
 });
 
-/* ============================= MANAGER: REPORT DATE PICKERS (Attendance / Sales) ============================= */
+/* ============================= MANAGER: REPORT DATE PICKERS ============================= */
 (function initReportDatePickers(){
   const attnPicker = document.getElementById('attendanceDatePicker');
   const attnTodayBtn = document.getElementById('attendanceTodayBtn');
@@ -129,7 +129,6 @@ document.querySelectorAll('#mgrTabs .tab-btn').forEach(btn=>{
       renderManager();
     };
   }
-
   const salesPicker = document.getElementById('salesDatePicker');
   const salesTodayBtn = document.getElementById('salesTodayBtn');
   if(salesPicker){
@@ -171,6 +170,19 @@ document.getElementById('resetBtn').onclick = async ()=>{
   renderManager();
 };
 
+/* Remove one location + its postcode + all its data. Requires:
+   DELETE /api/locations/:name  on the backend (Vercel KV server.js provided earlier). */
+async function deleteLocation(loc){
+  if(!confirm(`Remove "${loc}" and all its data (postcode, check-ins, reports)? This cannot be undone.`)) return;
+  try{
+    await api('/locations/' + encodeURIComponent(loc), { method:'DELETE', headers: authHeader() });
+    showToast('Removed: ' + loc);
+    renderManager();
+  }catch(e){
+    showToast('Failed to remove: ' + (e.message || 'unknown error'));
+  }
+}
+
 async function renderManager(){
   if(!authToken){ showManagerLogin(); return; }
 
@@ -192,25 +204,35 @@ async function renderManager(){
   document.getElementById('mgrWhoami').textContent = authUsername ? ('Signed in as '+authUsername) : '';
 
   const today = todayStr();
-  const locations = state.locations;
+  // De-duplicate the locations list itself — protects against any bad data
+  // where the same location name got listed twice.
+  const locations = Array.from(new Set(state.locations));
   const postcodes = state.postcodes || {};
   document.getElementById('locCount').textContent = locations.length;
 
   let checkedIn=0, totalFootfall=0, totalItemsSold=0, lowStockCount=0, issueCount=0;
   const rows = locations.map(loc=>{
     const d = state.data[loc] || { checkin:null, attendance:[], hourlyUpdates:[], inventoryReports:[], eod:null };
-    // A promoter is "checked in today" once d.checkin.date === today. That same
-    // record (name + ts) sticks around after checkout — only checkedOutTs gets
-    // set — so we can tell apart three states: never checked in today, still
-    // checked in, and checked in earlier but already checked out.
     const hasCheckinToday = !!(d.checkin && d.checkin.date === today);
     const isCheckedIn = hasCheckinToday && !d.checkin.checkedOutTs;
     const isCheckedOut = hasCheckinToday && !!d.checkin.checkedOutTs;
     const promoterName = hasCheckinToday ? d.checkin.name : null;
-    const todaysHourly = (d.hourlyUpdates||[]).filter(u=>isToday(u.ts));
-    const todaysInv = (d.inventoryReports||[]).filter(u=>isToday(u.ts));
+    // De-duplicate hourly/inventory entries by (timestamp+promoter) — a
+    // duplicate here means the same submission got double-posted (e.g. a
+    // double-tap before the button disabled), which is exactly what makes
+    // the same entity show multiple times in the Sales Report.
+    const dedupeByTs = (arr) => {
+      const seen = new Set();
+      return (arr||[]).filter(u=>{
+        const key = u.ts + '|' + (u.promoter||'');
+        if(seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+    };
+    const todaysHourly = dedupeByTs(d.hourlyUpdates).filter(u=>isToday(u.ts));
+    const todaysInv = dedupeByTs(d.inventoryReports).filter(u=>isToday(u.ts));
     let footfall=0, itemsSoldQty=0, hasIssue=false, lowStock=false;
-    // "itemsSoldQty" = total quantity of items sold today (not a dollar/amount figure)
     todaysHourly.forEach(u=>{
       footfall+=Number(u.footfall||0);
       (u.itemsSold||[]).forEach(it=>{ itemsSoldQty += Number(it.qty||0); });
@@ -235,8 +257,6 @@ async function renderManager(){
     {label:'Low / Out of Stock', value: lowStockCount, color:'var(--warn)'},
     {label:'Open Issues', value: issueCount, color:'var(--danger)'}
   ];
-  // checkedIn was accumulated as a closure variable above via the map — recompute
-  // cleanly here so the KPI is correct regardless of map execution order.
   checkedIn = rows.filter(r=>r.isCheckedIn).length;
   kpis[0].value = checkedIn+'/'+locations.length;
   kpis[1].value = checkedIn;
@@ -271,7 +291,10 @@ async function renderManager(){
     <div class="ticket" data-loc="${esc(r.loc)}">
       <div class="ticket-top">
         <div><div class="ticket-code">${locCode(r.loc, locations)}</div><div class="ticket-name">${esc(r.loc)}</div></div>
-        ${stamp}
+        <div style="display:flex;align-items:center;gap:8px;">
+          ${stamp}
+          <button type="button" class="icon-btn del-loc-btn" data-loc="${esc(r.loc)}" title="Remove this location">✕</button>
+        </div>
       </div>
       <div class="ticket-row"><span>Postcode</span><b>${esc(r.postcode)}</b></div>
       <div class="ticket-row"><span>Promoter</span><b>${r.promoterName ? esc(r.promoterName) : '—'}</b></div>
@@ -286,12 +309,17 @@ async function renderManager(){
   document.querySelectorAll('.ticket').forEach(el=>{
     el.onclick = ()=> openLocationDetail(el.dataset.loc);
   });
+  document.querySelectorAll('.del-loc-btn').forEach(btn=>{
+    btn.onclick = (e)=>{
+      e.stopPropagation();
+      deleteLocation(btn.dataset.loc);
+    };
+  });
 
   renderAttendanceTable(state);
   renderSalesReport(state);
 }
 
-/* ============================= MANAGER: PROMINENT ALERTS BANNER ============================= */
 function renderAlertsBanner(rows){
   const el = document.getElementById('alertsBanner');
   if(!el) return;
@@ -311,9 +339,13 @@ function renderAlertsBanner(rows){
 function renderAttendanceTable(state){
   const selDate = attendanceDate;
   const records = [];
+  const seen = new Set();
   state.locations.forEach(loc=>{
     const d = state.data[loc] || {};
     (d.attendance||[]).filter(a=>a.date===selDate).forEach(a=>{
+      const key = loc+'|'+a.name+'|'+a.checkinTs;
+      if(seen.has(key)) return;
+      seen.add(key);
       records.push({ loc, name:a.name, checkinTs:a.checkinTs, checkoutTs:a.checkoutTs, date:a.date });
     });
   });
@@ -339,16 +371,21 @@ function renderSalesReport(state){
   const selDate = salesDate;
   const itemTotals = {};
   const log = [];
+  const seenLog = new Set();
   state.locations.forEach(loc=>{
     const d = state.data[loc] || {};
     (d.hourlyUpdates||[]).filter(u=>isOnDate(u.ts, selDate)).forEach(u=>{
-      // "items sold" here = total quantity of items sold in this update
+      // De-duplicate identical hourly submissions (same loc+promoter+ts) —
+      // this was the cause of the same entity appearing multiple times.
+      const key = loc+'|'+u.promoter+'|'+u.ts;
+      if(seenLog.has(key)) return;
+      seenLog.add(key);
       const qtySold = (u.itemsSold||[]).reduce((s,it)=>s+Number(it.qty||0),0);
       log.push({ loc, promoter:u.promoter, ts:u.ts, footfall:u.footfall||0, itemsSoldQty: qtySold, itemsSold:u.itemsSold||[] });
       (u.itemsSold||[]).forEach(it=>{
         if(!it.item || !String(it.item).trim()) return;
-        const key = String(it.item).trim();
-        itemTotals[key] = (itemTotals[key]||0) + Number(it.qty||0);
+        const key2 = String(it.item).trim();
+        itemTotals[key2] = (itemTotals[key2]||0) + Number(it.qty||0);
       });
     });
   });
@@ -462,10 +499,8 @@ document.getElementById('endSessionBtn').onclick = ()=>{
 };
 
 /* ============================= PROMOTER: CHECK-IN / CHECK-OUT ============================= */
-/* Shows the FULL history of today's sessions for this promoter (not just the
-   most recent one), so checking in a second time no longer hides the first
-   check-in/check-out times. */
 async function handleCheckinClick(btn) {
+  if(btn.disabled) return; // guard against double-tap double-submit
   btn.disabled = true;
   btn.style.background = 'var(--danger)';
   btn.style.color = '#fff';
@@ -481,6 +516,7 @@ async function handleCheckinClick(btn) {
 }
 
 async function handleCheckoutClick(btn) {
+  if(btn.disabled) return;
   btn.disabled = true;
   btn.textContent = 'Checking out...';
   try {
@@ -542,7 +578,7 @@ async function renderCheckinBox(){
 
 /* ============================= PROMOTER: TABS ============================= */
 document.querySelectorAll('.tab-btn').forEach(btn=>{
-  if(btn.closest('#mgrTabs')) return; // manager tabs handled separately above
+  if(btn.closest('#mgrTabs')) return;
   btn.onclick = ()=>{
     document.querySelectorAll('.tabs:not(#mgrTabs) .tab-btn').forEach(b=>b.classList.remove('active'));
     btn.classList.add('active');
@@ -605,8 +641,6 @@ function addItemSoldRow(prefillName){
 }
 document.getElementById('addItemSoldRowBtn').onclick = ()=>addItemSoldRow();
 
-/* Quick-add chips: if an empty items-sold row exists, fill it in;
-   otherwise add a fresh row prefilled with the tapped item name. */
 function quickAddItemSold(name){
   const wrap = document.getElementById('itemsSoldRows');
   const rows = Array.from(wrap.querySelectorAll('.stock-row'));
@@ -620,64 +654,94 @@ function quickAddItemSold(name){
 }
 
 /* ============================= PROMOTER: SUBMIT HOURLY ============================= */
-document.getElementById('submitHourlyBtn').onclick = async ()=>{
-  const itemsSold = Array.from(document.querySelectorAll('#itemsSoldRows .stock-row')).map(r=>({
-    item: r.querySelector('.itemsold-item').value,
-    qty: r.querySelector('.itemsold-qty').value
-  })).filter(r=>r.item.trim());
-  const payload = {
-    location: session.location, promoter: session.name,
-    footfall: document.getElementById('h_footfall').value || 0,
-    activity: document.getElementById('h_activity').value,
-    itemsSold,
-    lowStock: !!hourlyLow,
-    issues: document.getElementById('h_issues').value,
-    comments: document.getElementById('h_comments').value
-  };
-  await api('/hourly', { method:'POST', body: JSON.stringify(payload) });
-  showToast('Hourly update submitted');
-  ['h_footfall','h_activity','h_issues','h_comments'].forEach(id=>document.getElementById(id).value='');
-  renderItemsSoldRows(1);
-  hourlyLow=null; document.getElementById('h_lowYes').className=''; document.getElementById('h_lowNo').className='';
-  renderMyLog();
+document.getElementById('submitHourlyBtn').onclick = async (e)=>{
+  const btn = e.currentTarget;
+  if(btn.disabled) return; // prevents double-tap double-submit -> duplicate sales rows
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = 'Submitting...';
+  try{
+    const itemsSold = Array.from(document.querySelectorAll('#itemsSoldRows .stock-row')).map(r=>({
+      item: r.querySelector('.itemsold-item').value,
+      qty: r.querySelector('.itemsold-qty').value
+    })).filter(r=>r.item.trim());
+    const payload = {
+      location: session.location, promoter: session.name,
+      footfall: document.getElementById('h_footfall').value || 0,
+      activity: document.getElementById('h_activity').value,
+      itemsSold,
+      lowStock: !!hourlyLow,
+      issues: document.getElementById('h_issues').value,
+      comments: document.getElementById('h_comments').value
+    };
+    await api('/hourly', { method:'POST', body: JSON.stringify(payload) });
+    showToast('Hourly update submitted');
+    ['h_footfall','h_activity','h_issues','h_comments'].forEach(id=>document.getElementById(id).value='');
+    renderItemsSoldRows(1);
+    hourlyLow=null; document.getElementById('h_lowYes').className=''; document.getElementById('h_lowNo').className='';
+    renderMyLog();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
 };
 
 /* ============================= PROMOTER: SUBMIT INVENTORY ============================= */
-document.getElementById('submitInventoryBtn').onclick = async ()=>{
-  const rows = Array.from(document.querySelectorAll('#stockRows .stock-row')).map(r=>({
-    item: r.querySelector('.stock-item').value,
-    qty: r.querySelector('.stock-qty').value
-  })).filter(r=>r.item.trim());
-  const payload = {
-    location: session.location, promoter: session.name,
-    stock: rows,
-    missing: document.getElementById('i_missing').value,
-    oos: document.getElementById('i_oos').value,
-    lowStockAlert: !!invLow
-  };
-  await api('/inventory', { method:'POST', body: JSON.stringify(payload) });
-  showToast('Inventory report submitted');
-  document.getElementById('i_missing').value=''; document.getElementById('i_oos').value='';
-  renderStockRows(1);
-  invLow=null; document.getElementById('i_lowYes').className=''; document.getElementById('i_lowNo').className='';
-  renderMyLog();
+document.getElementById('submitInventoryBtn').onclick = async (e)=>{
+  const btn = e.currentTarget;
+  if(btn.disabled) return;
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = 'Submitting...';
+  try{
+    const rows = Array.from(document.querySelectorAll('#stockRows .stock-row')).map(r=>({
+      item: r.querySelector('.stock-item').value,
+      qty: r.querySelector('.stock-qty').value
+    })).filter(r=>r.item.trim());
+    const payload = {
+      location: session.location, promoter: session.name,
+      stock: rows,
+      missing: document.getElementById('i_missing').value,
+      oos: document.getElementById('i_oos').value,
+      lowStockAlert: !!invLow
+    };
+    await api('/inventory', { method:'POST', body: JSON.stringify(payload) });
+    showToast('Inventory report submitted');
+    document.getElementById('i_missing').value=''; document.getElementById('i_oos').value='';
+    renderStockRows(1);
+    invLow=null; document.getElementById('i_lowYes').className=''; document.getElementById('i_lowNo').className='';
+    renderMyLog();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
 };
 
 /* ============================= PROMOTER: SUBMIT EOD ============================= */
-document.getElementById('submitEodBtn').onclick = async ()=>{
-  const payload = {
-    location: session.location, promoter: session.name,
-    date: todayStr(),
-    sales: document.getElementById('e_sales').value || 0,
-    samples: document.getElementById('e_samples').value || 0,
-    inventory: document.getElementById('e_inventory').value,
-    flavours: document.getElementById('e_flavours').value,
-    summary: document.getElementById('e_summary').value,
-    feedback: document.getElementById('e_feedback').value
-  };
-  await api('/eod', { method:'POST', body: JSON.stringify(payload) });
-  showToast('End of Day report submitted');
-  renderMyLog();
+document.getElementById('submitEodBtn').onclick = async (e)=>{
+  const btn = e.currentTarget;
+  if(btn.disabled) return;
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = 'Submitting...';
+  try{
+    const payload = {
+      location: session.location, promoter: session.name,
+      date: todayStr(),
+      sales: document.getElementById('e_sales').value || 0,
+      samples: document.getElementById('e_samples').value || 0,
+      inventory: document.getElementById('e_inventory').value,
+      flavours: document.getElementById('e_flavours').value,
+      summary: document.getElementById('e_summary').value,
+      feedback: document.getElementById('e_feedback').value
+    };
+    await api('/eod', { method:'POST', body: JSON.stringify(payload) });
+    showToast('End of Day report submitted');
+    renderMyLog();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
 };
 
 /* ============================= PROMOTER: MY LOG ============================= */
