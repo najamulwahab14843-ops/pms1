@@ -25,9 +25,9 @@ function verifyPassword(password, storedValue) {
 }
 
 const DEFAULT_ADMINS = [
-  { username: 'minha', password: 'Minha@Secure123' },
-  { username: 'azam', password: 'Azam@Secure123' },
-  { username: 'iqbal', password: 'Iqbal@Secure123' }
+  { username: 'Sasha', password: 'Sasha@Secure123' },
+  { username: 'Najam', password: 'NAJAMS@Secure123' },
+  { username: 'Viktorija', password: 'Viktorija@Secure123' }
 ];
 
 const app = express();
