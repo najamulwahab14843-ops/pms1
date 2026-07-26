@@ -1,769 +1,608 @@
-/* ============================= API HELPERS ============================= */
-async function api(path, opts) {
-  opts = opts || {};
-  const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
-  const res = await fetch('/api' + path, Object.assign({}, opts, { headers }));
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || 'Request failed');
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const path = require('path');
+const crypto = require('crypto');
+
+// Password Hashing helpers
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password, storedValue) {
+  if (!storedValue) return false;
+  if (!storedValue.includes(':')) {
+    // fallback if stored in plain text or env variables
+    return password === storedValue;
   }
-  return res.json();
-}
-const authHeader = () => (authToken ? { 'x-auth-token': authToken } : {});
-const getManagerState = () => api('/state?today=' + encodeURIComponent(todayStr()), { headers: authHeader() });
-const getPromoterState = (location) => api('/promoter-state?location=' + encodeURIComponent(location) + '&today=' + encodeURIComponent(todayStr()));
-
-/* ============================= UTIL ============================= */
-function esc(s){ return (s===undefined||s===null?'':String(s)).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
-function todayStr(){ const d=new Date(); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
-function dateStrOfTs(ts){ const d=new Date(ts); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0'); }
-function isToday(ts){ return todayStr() === dateStrOfTs(ts); }
-function isOnDate(ts, dateStr){ return dateStrOfTs(ts) === dateStr; }
-function fmtTime(ts){ return new Date(ts).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
-function timeAgo(ts){
-  const diff = Date.now()-ts; const m = Math.floor(diff/60000);
-  if(m<1) return 'just now'; if(m<60) return m+'m ago';
-  const h=Math.floor(m/60); return h+'h '+(m%60)+'m ago';
-}
-function durationStr(a,b){
-  const mins = Math.max(0, Math.round((b-a)/60000));
-  const h = Math.floor(mins/60), m = mins%60;
-  return (h ? h+'h ' : '') + m + 'm';
-}
-function locCode(loc, locations){ return 'LOC-'+String(locations.indexOf(loc)+1).padStart(2,'0'); }
-function showToast(msg){
-  const el = document.createElement('div'); el.className='toast'; el.textContent=msg;
-  document.getElementById('toastRoot').appendChild(el);
-  setTimeout(()=>el.remove(), 2400);
+  const [salt, originalHash] = storedValue.split(':');
+  const hash = crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+  return hash === originalHash;
 }
 
-/* ============================= SESSION (in-memory only) ============================= */
-let session = null;
-let currentTab = 'hourly';
-let hourlyLow = null;
-let invLow = null;
+const DEFAULT_ADMINS = [
+  { username: 'najam', password: 'Najam@Secure123' },
+  { username: 'sasha', password: 'Sasha@Secure123' },
+  { username: 'viktorijia', password: 'Viktorijia@Secure123' }
+];
 
-/* ============================= MANAGER AUTH (in-memory only) ============================= */
-let authToken = null;
-let authUsername = null;
+const app = express();
+app.use(cors());
+app.use(express.json());
 
-/* ============================= MANAGER REPORT DATE FILTERS (in-memory only) ============================= */
-let attendanceDate = todayStr();
-let salesDate = todayStr();
+// Server configuration
+const PORT = process.env.PORT || 3000;
+const MONGODB_URI = process.env.MONGODB_URI;
+const JWT_SECRET = process.env.JWT_SECRET || 'fallback_secret_key_for_promotrack';
+const MANAGER_USERNAME = process.env.MANAGER_USERNAME || 'admin';
+const MANAGER_PASSWORD = process.env.MANAGER_PASSWORD || 'admin';
 
-/* ============================= CLOCK ============================= */
-setInterval(()=>{ document.getElementById('clock').textContent = new Date().toLocaleTimeString(); }, 1000);
+const isMongo = !!MONGODB_URI;
 
-/* ============================= ROLE TOGGLE ============================= */
-document.getElementById('roleBtnManager').onclick = ()=> switchRole('manager');
-document.getElementById('roleBtnPromoter').onclick = ()=> switchRole('promoter');
-function switchRole(role){
-  document.getElementById('roleBtnManager').classList.toggle('active', role==='manager');
-  document.getElementById('roleBtnPromoter').classList.toggle('active', role==='promoter');
-  document.getElementById('managerView').classList.toggle('hidden', role!=='manager');
-  document.getElementById('promoterView').classList.toggle('hidden', role!=='promoter');
-  if(role==='manager') renderManager();
-}
+// ============================= DATABASE SETUP & SEEDING =============================
+let Admin, Location, Attendance, HourlyUpdate, InventoryReport, EodReport;
 
-/* ============================= MANAGER LOGIN ============================= */
-function showManagerLogin(){
-  document.getElementById('managerDashboardContent').classList.add('hidden');
-  document.getElementById('managerLoginPanel').classList.remove('hidden');
-  document.getElementById('syncLabel').textContent = 'Sign-in required';
-}
-document.getElementById('mgrLoginBtn').onclick = async ()=>{
-  const username = document.getElementById('mgrUsername').value.trim();
-  const password = document.getElementById('mgrPassword').value;
-  const errEl = document.getElementById('mgrLoginError');
-  errEl.classList.add('hidden');
-  if(!username || !password){
-    errEl.textContent = 'Enter both username and password.';
-    errEl.classList.remove('hidden');
-    return;
-  }
-  try{
-    const data = await api('/login', { method:'POST', body: JSON.stringify({ username, password }) });
-    authToken = data.token; authUsername = data.username;
-    document.getElementById('mgrUsername').value=''; document.getElementById('mgrPassword').value='';
-    renderManager();
-  }catch(e){
-    errEl.textContent = e.message || 'Login failed.';
-    errEl.classList.remove('hidden');
-  }
-};
-document.getElementById('mgrPassword').addEventListener('keydown', e=>{
-  if(e.key==='Enter') document.getElementById('mgrLoginBtn').click();
-});
-document.getElementById('logoutBtn').onclick = async ()=>{
-  try{ await api('/logout', { method:'POST', headers: authHeader() }); }catch(e){}
-  authToken = null; authUsername = null;
-  renderManager();
-};
-
-/* ============================= MANAGER TABS ============================= */
-document.querySelectorAll('#mgrTabs .tab-btn').forEach(btn=>{
-  btn.onclick = ()=>{
-    document.querySelectorAll('#mgrTabs .tab-btn').forEach(b=>b.classList.remove('active'));
-    btn.classList.add('active');
-    ['overview','attendance','sales'].forEach(t=>document.getElementById('mgrtab-'+t).classList.add('hidden'));
-    document.getElementById('mgrtab-'+btn.dataset.mgrtab).classList.remove('hidden');
-  };
-});
-
-/* ============================= MANAGER: REPORT DATE PICKERS ============================= */
-(function initReportDatePickers(){
-  const attnPicker = document.getElementById('attendanceDatePicker');
-  const attnTodayBtn = document.getElementById('attendanceTodayBtn');
-  if(attnPicker){
-    attnPicker.max = todayStr();
-    attnPicker.value = attendanceDate;
-    attnPicker.addEventListener('change', e=>{
-      attendanceDate = e.target.value || todayStr();
-      renderManager();
+if (isMongo) {
+  console.log('Connecting to MongoDB...');
+  mongoose.set('bufferCommands', false); // Disable query buffering so mongoose queries fail immediately instead of hanging if offline
+  mongoose.connect(MONGODB_URI)
+    .then(() => {
+      console.log('Connected to MongoDB successfully.');
+      // NOTE: seedDefaultLocations() intentionally NOT called.
+      // No fixed/default locations are seeded — only locations added
+      // via POST /api/locations will ever appear.
+      seedDefaultAdmins();
+    })
+    .catch(err => {
+      console.error('MongoDB connection error:', err);
     });
-  }
-  if(attnTodayBtn){
-    attnTodayBtn.onclick = ()=>{
-      attendanceDate = todayStr();
-      if(attnPicker) attnPicker.value = attendanceDate;
-      renderManager();
-    };
-  }
-  const salesPicker = document.getElementById('salesDatePicker');
-  const salesTodayBtn = document.getElementById('salesTodayBtn');
-  if(salesPicker){
-    salesPicker.max = todayStr();
-    salesPicker.value = salesDate;
-    salesPicker.addEventListener('change', e=>{
-      salesDate = e.target.value || todayStr();
-      renderManager();
-    });
-  }
-  if(salesTodayBtn){
-    salesTodayBtn.onclick = ()=>{
-      salesDate = todayStr();
-      if(salesPicker) salesPicker.value = salesDate;
-      renderManager();
-    };
-  }
-})();
 
-/* ============================= MANAGER RENDER ============================= */
-let managerFilter = 'all';
-let managerSearch = '';
+  // Mongoose Schemas
+  const AdminSchema = new mongoose.Schema({
+    username: { type: String, required: true, unique: true },
+    password: { type: String, required: true }
+  });
 
-document.getElementById('searchInput').addEventListener('input', e=>{ managerSearch = e.target.value.toLowerCase(); renderManager(); });
-document.getElementById('filterSelect').addEventListener('change', e=>{ managerFilter = e.target.value; renderManager(); });
-document.getElementById('refreshBtn').onclick = renderManager;
-document.getElementById('addLocationBtn').onclick = async ()=>{
-  const name = prompt('New location name:');
-  if(!name) return;
-  const postcode = prompt('Postcode for this location (optional):') || '';
-  await api('/locations', { method:'POST', body: JSON.stringify({ name: name.trim(), postcode: postcode.trim() }) });
-  showToast('Location added: '+name.trim());
-  renderManager();
-};
-document.getElementById('resetBtn').onclick = async ()=>{
-  if(!confirm('This clears all check-ins, updates, and reports on the server. Continue?')) return;
-  await api('/reset', { method:'POST', headers: authHeader() });
-  showToast('Demo data reset');
-  renderManager();
-};
+  const LocationSchema = new mongoose.Schema({
+    name: { type: String, required: true, unique: true },
+    postcode: { type: String }
+  });
 
-/* Remove one location + its postcode + all its data. Requires:
-   DELETE /api/locations/:name  on the backend (Vercel KV server.js provided earlier). */
-async function deleteLocation(loc){
-  if(!confirm(`Remove "${loc}" and all its data (postcode, check-ins, reports)? This cannot be undone.`)) return;
-  try{
-    await api('/locations/' + encodeURIComponent(loc), { method:'DELETE', headers: authHeader() });
-    showToast('Removed: ' + loc);
-    renderManager();
-  }catch(e){
-    showToast('Failed to remove: ' + (e.message || 'unknown error'));
-  }
+  const AttendanceSchema = new mongoose.Schema({
+    location: { type: String, required: true },
+    name: { type: String, required: true },
+    checkinTs: { type: Number, required: true },
+    checkoutTs: { type: Number },
+    date: { type: String, required: true }
+  });
+
+  const HourlyUpdateSchema = new mongoose.Schema({
+    location: { type: String, required: true },
+    promoter: { type: String, required: true },
+    ts: { type: Number, required: true },
+    footfall: { type: Number, default: 0 },
+    activity: { type: String },
+    itemsSold: [{
+      item: { type: String },
+      qty: { type: Number }
+    }],
+    lowStock: { type: Boolean, default: false },
+    issues: { type: String },
+    comments: { type: String }
+  });
+
+  const InventoryReportSchema = new mongoose.Schema({
+    location: { type: String, required: true },
+    promoter: { type: String, required: true },
+    ts: { type: Number, required: true },
+    stock: [{
+      item: { type: String },
+      qty: { type: Number }
+    }],
+    missing: { type: String },
+    oos: { type: String },
+    lowStockAlert: { type: Boolean, default: false }
+  });
+
+  const EodReportSchema = new mongoose.Schema({
+    location: { type: String, required: true },
+    promoter: { type: String, required: true },
+    date: { type: String, required: true },
+    ts: { type: Number, required: true },
+    sales: { type: Number, default: 0 },
+    samples: { type: Number, default: 0 },
+    inventory: { type: String },
+    flavours: { type: String },
+    summary: { type: String },
+    feedback: { type: String }
+  });
+
+  Admin = mongoose.model('Admin', AdminSchema);
+  Location = mongoose.model('Location', LocationSchema);
+  Attendance = mongoose.model('Attendance', AttendanceSchema);
+  HourlyUpdate = mongoose.model('HourlyUpdate', HourlyUpdateSchema);
+  InventoryReport = mongoose.model('InventoryReport', InventoryReportSchema);
+  EodReport = mongoose.model('EodReport', EodReportSchema);
+} else {
+  console.warn('WARNING: MONGODB_URI environment variable is not defined.');
+  console.warn('Running in in-memory database mode. Data will reset on server restarts.');
 }
 
-async function renderManager(){
-  if(!authToken){ showManagerLogin(); return; }
+// In-Memory Data Store (Fallback)
+let memoryAdmins = [
+  { username: 'najam', password: hashPassword('Najam@Secure123') },
+  { username: 'sasha', password: hashPassword('Sasha@Secure123') },
+  { username: 'viktorijia', password: hashPassword('Viktorijia@Secure123') }
+];
 
-  document.getElementById('syncLabel').textContent = 'Syncing…';
-  let state;
-  try{ state = await getManagerState(); }
-  catch(e){
-    if(String(e.message||'').toLowerCase().includes('unauthorized')){
-      authToken = null; authUsername = null;
-      showManagerLogin();
-      return;
+// Starts EMPTY — no fixed/default locations. Only locations added via
+// POST /api/locations will ever appear here.
+let memoryLocations = [];
+
+let memoryAttendance = [];
+let memoryHourlyUpdates = [];
+let memoryInventoryReports = [];
+let memoryEodReports = [];
+
+// Seed default admins for MongoDB if database is empty
+async function seedDefaultAdmins() {
+  try {
+    for (const defAdmin of DEFAULT_ADMINS) {
+      const existing = await Admin.findOne({ username: defAdmin.username });
+      if (!existing) {
+        console.log(`Seeding admin: ${defAdmin.username}...`);
+        const hashedPassword = hashPassword(defAdmin.password);
+        await new Admin({
+          username: defAdmin.username,
+          password: hashedPassword
+        }).save();
+      }
     }
-    document.getElementById('syncLabel').textContent = 'Offline';
-    return;
+    console.log('Admin seeding check complete.');
+  } catch (err) {
+    console.error('Failed to seed admins:', err);
   }
-  document.getElementById('managerLoginPanel').classList.add('hidden');
-  document.getElementById('managerDashboardContent').classList.remove('hidden');
-  document.getElementById('syncLabel').textContent = 'Live';
-  document.getElementById('mgrWhoami').textContent = authUsername ? ('Signed in as '+authUsername) : '';
+}
 
-  const today = todayStr();
-  // De-duplicate the locations list itself — protects against any bad data
-  // where the same location name got listed twice.
-  const locations = Array.from(new Set(state.locations));
-  const postcodes = state.postcodes || {};
-  document.getElementById('locCount').textContent = locations.length;
+// ============================= DATA ACCESS LAYER =============================
+const hasMongoConnection = () => isMongo && mongoose.connection.readyState === 1;
 
-  let checkedIn=0, totalFootfall=0, totalItemsSold=0, lowStockCount=0, issueCount=0;
-  const rows = locations.map(loc=>{
-    const d = state.data[loc] || { checkin:null, attendance:[], hourlyUpdates:[], inventoryReports:[], eod:null };
-    const hasCheckinToday = !!(d.checkin && d.checkin.date === today);
-    const isCheckedIn = hasCheckinToday && !d.checkin.checkedOutTs;
-    const isCheckedOut = hasCheckinToday && !!d.checkin.checkedOutTs;
-    const promoterName = hasCheckinToday ? d.checkin.name : null;
-    // De-duplicate hourly/inventory entries by (timestamp+promoter) — a
-    // duplicate here means the same submission got double-posted (e.g. a
-    // double-tap before the button disabled), which is exactly what makes
-    // the same entity show multiple times in the Sales Report.
-    const dedupeByTs = (arr) => {
-      const seen = new Set();
-      return (arr||[]).filter(u=>{
-        const key = u.ts + '|' + (u.promoter||'');
-        if(seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-    };
-    const todaysHourly = dedupeByTs(d.hourlyUpdates).filter(u=>isToday(u.ts));
-    const todaysInv = dedupeByTs(d.inventoryReports).filter(u=>isToday(u.ts));
-    let footfall=0, itemsSoldQty=0, hasIssue=false, lowStock=false;
-    todaysHourly.forEach(u=>{
-      footfall+=Number(u.footfall||0);
-      (u.itemsSold||[]).forEach(it=>{ itemsSoldQty += Number(it.qty||0); });
-      if(u.issues && u.issues.trim()) hasIssue=true;
-      if(u.lowStock) lowStock=true;
+async function findAdmin(username) {
+  if (hasMongoConnection()) {
+    return await Admin.findOne({ username });
+  } else {
+    return memoryAdmins.find(a => a.username === username);
+  }
+}
+
+async function getLocations() {
+  return hasMongoConnection() ? await Location.find({}) : memoryLocations;
+}
+
+async function addLocation(name, postcode) {
+  if (hasMongoConnection()) {
+    const loc = new Location({ name, postcode });
+    await loc.save();
+    return loc;
+  } else {
+    const newLoc = { name, postcode };
+    memoryLocations.push(newLoc);
+    return newLoc;
+  }
+}
+
+async function getAttendance(query = {}) {
+  if (hasMongoConnection()) {
+    return await Attendance.find(query);
+  } else {
+    return memoryAttendance.filter(item => {
+      for (let k in query) {
+        if (item[k] !== query[k]) return false;
+      }
+      return true;
     });
-    todaysInv.forEach(u=>{ if(u.lowStockAlert) lowStock=true; });
-    if(d.eod && d.eod.date===today){ if(d.eod.feedback && d.eod.feedback.trim()) hasIssue=true; }
-    totalFootfall+=footfall; totalItemsSold+=itemsSoldQty;
-    if(lowStock) lowStockCount++;
-    if(hasIssue) issueCount++;
-    const lastEvents = [...todaysHourly.map(u=>u.ts), ...todaysInv.map(u=>u.ts)];
-    const lastTs = lastEvents.length ? Math.max(...lastEvents) : (hasCheckinToday ? d.checkin.ts : null);
-    return {loc, d, isCheckedIn, isCheckedOut, hasCheckinToday, promoterName, footfall, itemsSoldQty, hasIssue, lowStock, lastTs, eodDone: d.eod && d.eod.date===today, postcode: postcodes[loc] || '—'};
-  });
-
-  const kpis = [
-    {label:'Locations Active', value: checkedIn+'/'+locations.length, color:'var(--primary)'},
-    {label:'Checked In', value: checkedIn, color:'var(--good)'},
-    {label:'Footfall Today', value: totalFootfall, color:'var(--primary)'},
-    {label:'Items Sold Today', value: totalItemsSold.toLocaleString(), color:'var(--good)'},
-    {label:'Low / Out of Stock', value: lowStockCount, color:'var(--warn)'},
-    {label:'Open Issues', value: issueCount, color:'var(--danger)'}
-  ];
-  checkedIn = rows.filter(r=>r.isCheckedIn).length;
-  kpis[0].value = checkedIn+'/'+locations.length;
-  kpis[1].value = checkedIn;
-
-  renderAlertsBanner(rows);
-
-  document.getElementById('kpiStrip').innerHTML = kpis.map(k=>`
-    <div class="kpi" style="--kpi-color:${k.color}">
-      <div class="kpi-label">${k.label}</div>
-      <div class="kpi-value">${k.value}</div>
-    </div>`).join('');
-
-  let filtered = rows.filter(r=>{
-    if(managerSearch && !r.loc.toLowerCase().includes(managerSearch) && !String(r.postcode).toLowerCase().includes(managerSearch)) return false;
-    if(managerFilter==='in' && !r.isCheckedIn) return false;
-    if(managerFilter==='out' && r.isCheckedIn) return false;
-    if(managerFilter==='low' && !r.lowStock) return false;
-    if(managerFilter==='issue' && !r.hasIssue) return false;
-    return true;
-  });
-
-  document.getElementById('cardsGrid').innerHTML = filtered.map(r=>{
-    const stamp = r.isCheckedIn
-      ? `<div class="stamp good">Checked In</div>`
-      : (r.isCheckedOut ? `<div class="stamp out">Checked Out</div>` : `<div class="stamp pending">Awaiting</div>`);
-    const badges = [];
-    if(r.lowStock) badges.push(`<span class="badge low">⚠ Low Stock</span>`);
-    if(r.hasIssue) badges.push(`<span class="badge issue">⚠ Issue Reported</span>`);
-    if(r.eodDone) badges.push(`<span class="badge ok">EOD Filed</span>`);
-    if(!badges.length) badges.push(`<span class="badge neutral">Nominal</span>`);
-    return `
-    <div class="ticket" data-loc="${esc(r.loc)}">
-      <div class="ticket-top">
-        <div><div class="ticket-code">${locCode(r.loc, locations)}</div><div class="ticket-name">${esc(r.loc)}</div></div>
-        <div style="display:flex;align-items:center;gap:8px;">
-          ${stamp}
-          <button type="button" class="icon-btn del-loc-btn" data-loc="${esc(r.loc)}" title="Remove this location">✕</button>
-        </div>
-      </div>
-      <div class="ticket-row"><span>Postcode</span><b>${esc(r.postcode)}</b></div>
-      <div class="ticket-row"><span>Promoter</span><b>${r.promoterName ? esc(r.promoterName) : '—'}</b></div>
-      <div class="ticket-row"><span>Last update</span><b>${r.lastTs ? timeAgo(r.lastTs) : '—'}</b></div>
-      <hr class="ticket-divider">
-      <div class="ticket-row"><span>Footfall today</span><b>${r.footfall}</b></div>
-      <div class="ticket-row"><span>Items sold today</span><b>${r.itemsSoldQty.toLocaleString()}</b></div>
-      <div class="badge-row">${badges.join('')}</div>
-    </div>`;
-  }).join('') || `<p class="empty-note">No locations match this filter.</p>`;
-
-  document.querySelectorAll('.ticket').forEach(el=>{
-    el.onclick = ()=> openLocationDetail(el.dataset.loc);
-  });
-  document.querySelectorAll('.del-loc-btn').forEach(btn=>{
-    btn.onclick = (e)=>{
-      e.stopPropagation();
-      deleteLocation(btn.dataset.loc);
-    };
-  });
-
-  renderAttendanceTable(state);
-  renderSalesReport(state);
+  }
 }
 
-function renderAlertsBanner(rows){
-  const el = document.getElementById('alertsBanner');
-  if(!el) return;
-  const alerts = [];
-  rows.forEach(r=>{
-    if(r.lowStock) alerts.push({loc:r.loc, level:'danger', text:'Low / out of stock'});
-    if(r.hasIssue) alerts.push({loc:r.loc, level:'warn', text:'Issue reported'});
-  });
-  if(!alerts.length){ el.innerHTML=''; return; }
-  el.innerHTML = alerts.map(a=>`
-    <div class="alert-banner-item ${a.level}">
-      <span class="a-icon">${a.level==='danger' ? '🔴' : '⚠️'}</span>
-      <span><b>${esc(a.loc)}</b> — ${esc(a.text)}</span>
-    </div>`).join('');
+async function addAttendance(doc) {
+  return hasMongoConnection() ? await new Attendance(doc).save() : (memoryAttendance.push(doc), doc);
 }
 
-function renderAttendanceTable(state){
-  const selDate = attendanceDate;
-  const records = [];
-  const seen = new Set();
-  state.locations.forEach(loc=>{
-    const d = state.data[loc] || {};
-    (d.attendance||[]).filter(a=>a.date===selDate).forEach(a=>{
-      const key = loc+'|'+a.name+'|'+a.checkinTs;
-      if(seen.has(key)) return;
-      seen.add(key);
-      records.push({ loc, name:a.name, checkinTs:a.checkinTs, checkoutTs:a.checkoutTs, date:a.date });
+async function updateAttendance(query, updateDoc) {
+  if (hasMongoConnection()) {
+    return await Attendance.updateOne(query, { $set: updateDoc });
+  } else {
+    // Find active checkin for promoter today (which would match the query: checkoutTs: null)
+    const record = memoryAttendance.slice().reverse().find(item => {
+      for (let k in query) {
+        const queryVal = query[k];
+        if (queryVal === null || queryVal === undefined) {
+          if (item[k] !== undefined && item[k] !== null) return false;
+        } else if (item[k] !== queryVal) {
+          return false;
+        }
+      }
+      return true;
     });
-  });
-  records.sort((a,b)=>b.checkinTs-a.checkinTs);
-  document.getElementById('attendanceTable').innerHTML = records.length ? `
-    <table class="report-table">
-      <thead><tr><th>Date</th><th>Location</th><th>Promoter</th><th>Checked in</th><th>Checked out</th><th>Duration</th></tr></thead>
-      <tbody>
-        ${records.map(r=>`
-          <tr>
-            <td>${esc(r.date)}</td>
-            <td>${esc(r.loc)}</td>
-            <td>${esc(r.name)}</td>
-            <td>${fmtTime(r.checkinTs)}</td>
-            <td>${r.checkoutTs ? fmtTime(r.checkoutTs) : '—'}</td>
-            <td>${r.checkoutTs ? durationStr(r.checkinTs, r.checkoutTs) : 'Still in'}</td>
-          </tr>`).join('')}
-      </tbody>
-    </table>` : `<p class="empty-note">No attendance recorded for ${esc(selDate)}.</p>`;
+    if (record) {
+      Object.assign(record, updateDoc);
+    }
+    return record;
+  }
 }
 
-function renderSalesReport(state){
-  const selDate = salesDate;
-  const itemTotals = {};
-  const log = [];
-  const seenLog = new Set();
-  state.locations.forEach(loc=>{
-    const d = state.data[loc] || {};
-    (d.hourlyUpdates||[]).filter(u=>isOnDate(u.ts, selDate)).forEach(u=>{
-      // De-duplicate identical hourly submissions (same loc+promoter+ts) —
-      // this was the cause of the same entity appearing multiple times.
-      const key = loc+'|'+u.promoter+'|'+u.ts;
-      if(seenLog.has(key)) return;
-      seenLog.add(key);
-      const qtySold = (u.itemsSold||[]).reduce((s,it)=>s+Number(it.qty||0),0);
-      log.push({ loc, promoter:u.promoter, ts:u.ts, footfall:u.footfall||0, itemsSoldQty: qtySold, itemsSold:u.itemsSold||[] });
-      (u.itemsSold||[]).forEach(it=>{
-        if(!it.item || !String(it.item).trim()) return;
-        const key2 = String(it.item).trim();
-        itemTotals[key2] = (itemTotals[key2]||0) + Number(it.qty||0);
-      });
+async function getHourlyUpdates(query = {}) {
+  if (hasMongoConnection()) {
+    return await HourlyUpdate.find(query);
+  } else {
+    return memoryHourlyUpdates.filter(item => {
+      for (let k in query) {
+        if (item[k] !== query[k]) return false;
+      }
+      return true;
     });
-  });
-  log.sort((a,b)=>b.ts-a.ts);
-  const items = Object.entries(itemTotals).sort((a,b)=>b[1]-a[1]);
-
-  document.getElementById('salesSummary').innerHTML = items.length ? `
-    <h4 style="margin-top:0;">Items sold — ${esc(selDate)}</h4>
-    <table class="report-table">
-      <thead><tr><th>Item</th><th>Qty sold</th></tr></thead>
-      <tbody>${items.map(([item,qty])=>`<tr><td>${esc(item)}</td><td>${qty}</td></tr>`).join('')}</tbody>
-    </table>` : `<p class="empty-note">No items logged as sold on ${esc(selDate)}.</p>`;
-
-  document.getElementById('salesLog').innerHTML = log.length ? `
-    <h4>Sales log — ${esc(selDate)}</h4>
-    <table class="report-table">
-      <thead><tr><th>Location</th><th>Promoter</th><th>Time</th><th>Footfall</th><th>Items Sold</th><th>Breakdown</th></tr></thead>
-      <tbody>
-        ${log.map(r=>`
-          <tr>
-            <td>${esc(r.loc)}</td>
-            <td>${esc(r.promoter)}</td>
-            <td>${fmtTime(r.ts)}</td>
-            <td>${r.footfall}</td>
-            <td>${r.itemsSoldQty.toLocaleString()}</td>
-            <td>${(r.itemsSold||[]).filter(it=>it.item && String(it.item).trim()).map(it=>esc(it.item)+' ×'+esc(it.qty)).join(', ') || '—'}</td>
-          </tr>`).join('')}
-      </tbody>
-    </table>` : `<p class="empty-note">No hourly sales logged on ${esc(selDate)}.</p>`;
+  }
 }
 
-async function openLocationDetail(loc){
-  const state = await getManagerState();
-  const d = state.data[loc] || { checkin:null, attendance:[], hourlyUpdates:[], inventoryReports:[], eod:null };
-  const postcode = (state.postcodes || {})[loc];
-  const today = todayStr();
-  const events = [];
-  (d.hourlyUpdates||[]).filter(u=>isToday(u.ts)).forEach(u=> events.push({ts:u.ts, type:'Hourly Update', body:
-    `<b>Footfall:</b> ${u.footfall||0} &nbsp; <b>Items Sold:</b> ${(u.itemsSold||[]).reduce((s,it)=>s+Number(it.qty||0),0)}${u.lowStock?' &nbsp; <b>⚠ Low stock flagged</b>':''}<br>${u.activity?esc(u.activity)+'<br>':''}${(u.itemsSold&&u.itemsSold.length)?'<b>Items sold:</b> '+u.itemsSold.filter(it=>it.item&&String(it.item).trim()).map(it=>esc(it.item)+' ×'+esc(it.qty)).join(', ')+'<br>':''}${u.issues?'<b>Issue:</b> '+esc(u.issues)+'<br>':''}${u.comments?esc(u.comments):''}`
-  }));
-  (d.inventoryReports||[]).filter(u=>isToday(u.ts)).forEach(u=> events.push({ts:u.ts, type:'Inventory Report', body:
-    `${(u.stock||[]).map(s=>esc(s.item)+': '+esc(s.qty)).join(', ')||'No stock items listed'}<br>${u.missing?'<b>Missing:</b> '+esc(u.missing)+'<br>':''}${u.oos?'<b>Out of stock:</b> '+esc(u.oos)+'<br>':''}${u.lowStockAlert?'<b>⚠ Low stock alert raised</b>':''}`
-  }));
-  (d.attendance||[]).filter(a=>a.date===today).forEach(a=>{
-    events.push({ts:a.checkinTs, type:'Check-in', body:`${esc(a.name)} checked in.`});
-    if(a.checkoutTs) events.push({ts:a.checkoutTs, type:'Check-out', body:`${esc(a.name)} checked out (${durationStr(a.checkinTs,a.checkoutTs)} on shift).`});
-  });
-  if(d.eod && d.eod.date===today) events.push({ts:d.eod.ts, type:'End of Day Report', body:
-    `<b>Total sales:</b> ${d.eod.sales||0} &nbsp; <b>Samples left:</b> ${d.eod.samples||0}<br>${d.eod.inventory?'<b>Remaining inventory:</b> '+esc(d.eod.inventory)+'<br>':''}${d.eod.flavours?'<b>Remaining flavours:</b> '+esc(d.eod.flavours)+'<br>':''}${d.eod.summary?'<b>Summary:</b> '+esc(d.eod.summary)+'<br>':''}${d.eod.feedback?'<b>Feedback:</b> '+esc(d.eod.feedback):''}`
-  });
-  events.sort((a,b)=>b.ts-a.ts);
-
-  document.getElementById('modalRoot').innerHTML = `
-    <div class="modal-overlay" id="overlay">
-      <div class="modal">
-        <div class="modal-header">
-          <div>
-            <h2>${esc(loc)}</h2>
-            ${postcode ? `<p class="sub" style="margin:2px 0 0;">Postcode: ${esc(postcode)}</p>` : ''}
-          </div>
-          <button class="modal-close" id="closeModal">&times;</button>
-        </div>
-        <div class="modal-body">
-          ${events.length ? events.map(e=>`
-            <div class="timeline-item">
-              <div class="t-head"><span class="t-type">${e.type}</span><span>${fmtTime(e.ts)}</span></div>
-              <div class="t-body">${e.body}</div>
-            </div>`).join('') : '<p class="empty-note">No activity logged yet today.</p>'}
-        </div>
-      </div>
-    </div>`;
-  document.getElementById('closeModal').onclick = ()=> document.getElementById('modalRoot').innerHTML='';
-  document.getElementById('overlay').onclick = (e)=>{ if(e.target.id==='overlay') document.getElementById('modalRoot').innerHTML=''; };
+async function addHourlyUpdate(doc) {
+  return hasMongoConnection() ? await new HourlyUpdate(doc).save() : (memoryHourlyUpdates.push(doc), doc);
 }
 
-/* ============================= PROMOTER: SETUP ============================= */
-document.getElementById('startShiftBtn').onclick = async ()=>{
-  const name = document.getElementById('setupName').value.trim();
-  const loc = document.getElementById('setupNewLocation').value.trim();
-  const postcode = document.getElementById('setupPostcode').value.trim();
-  if(!name){ alert('Please enter your name.'); return; }
-  if(!loc){ alert('Please enter a location.'); return; }
-  try{
-    await api('/locations', { method:'POST', body: JSON.stringify({ name: loc, postcode }) });
-  }catch(e){
-    // If the location already exists, that's fine — just continue the shift.
-    // Any other error should stop and inform the promoter.
-    if(!String(e.message||'').toLowerCase().includes('already exists')){
-      alert('Could not save location: ' + (e.message || 'unknown error'));
-      return;
+async function getInventoryReports(query = {}) {
+  if (hasMongoConnection()) {
+    return await InventoryReport.find(query);
+  } else {
+    return memoryInventoryReports.filter(item => {
+      for (let k in query) {
+        if (item[k] !== query[k]) return false;
+      }
+      return true;
+    });
+  }
+}
+
+async function addInventoryReport(doc) {
+  return hasMongoConnection() ? await new InventoryReport(doc).save() : (memoryInventoryReports.push(doc), doc);
+}
+
+async function getEodReports(query = {}) {
+  if (hasMongoConnection()) {
+    return await EodReport.find(query);
+  } else {
+    return memoryEodReports.filter(item => {
+      for (let k in query) {
+        if (item[k] !== query[k]) return false;
+      }
+      return true;
+    });
+  }
+}
+
+async function saveEodReport(query, doc) {
+  if (hasMongoConnection()) {
+    return await EodReport.findOneAndUpdate(query, doc, { upsert: true, new: true });
+  } else {
+    const index = memoryEodReports.findIndex(item => {
+      for (let k in query) {
+        if (item[k] !== query[k]) return false;
+      }
+      return true;
+    });
+    if (index !== -1) {
+      memoryEodReports[index] = Object.assign({}, memoryEodReports[index], doc);
+      return memoryEodReports[index];
+    } else {
+      memoryEodReports.push(doc);
+      return doc;
     }
   }
-  session = { name, location: loc };
-  document.getElementById('promoterSetup').classList.add('hidden');
-  document.getElementById('promoterMain').classList.remove('hidden');
-  document.getElementById('sessName').textContent = name;
-  document.getElementById('sessLoc').textContent = loc.toUpperCase();
-  renderStockRows(1);
-  renderItemsSoldRows(1);
-  await renderCheckinBox();
-  renderMyLog();
-};
-document.getElementById('endSessionBtn').onclick = ()=>{
-  session = null;
-  document.getElementById('promoterMain').classList.add('hidden');
-  document.getElementById('promoterSetup').classList.remove('hidden');
-  document.getElementById('setupName').value='';
-  document.getElementById('setupNewLocation').value='';
-  document.getElementById('setupPostcode').value='';
-};
-
-/* ============================= PROMOTER: CHECK-IN / CHECK-OUT ============================= */
-async function handleCheckinClick(btn) {
-  if(btn.disabled) return; // guard against double-tap double-submit
-  btn.disabled = true;
-  btn.style.background = 'var(--danger)';
-  btn.style.color = '#fff';
-  btn.style.borderColor = 'var(--danger)';
-  btn.textContent = 'Checking in...';
-  try {
-    await api('/checkin', { method:'POST', body: JSON.stringify({ location: session.location, name: session.name, date: todayStr() }) });
-    showToast('Checked in — visible on manager dashboard');
-  } catch (err) {
-    showToast('Check-in failed: ' + err.message);
-  }
-  await renderCheckinBox();
 }
 
-async function handleCheckoutClick(btn) {
-  if(btn.disabled) return;
-  btn.disabled = true;
-  btn.textContent = 'Checking out...';
-  try {
-    await api('/checkout', { method:'POST', body: JSON.stringify({ location: session.location, name: session.name }) });
-    showToast('Checked out');
-  } catch (err) {
-    showToast('Check-out failed: ' + err.message);
-  }
-  await renderCheckinBox();
-}
-
-async function renderCheckinBox(){
-  const state = await getPromoterState(session.location);
-  const d = state.data;
-  const today = todayStr();
-  const box = document.getElementById('checkinBox');
-
-  const mySessions = (d.attendance||[])
-    .filter(a=>a.date===today && a.name===session.name)
-    .sort((a,b)=>a.checkinTs-b.checkinTs);
-  const last = mySessions[mySessions.length-1];
-  const currentlyIn = !!(last && !last.checkoutTs);
-
-  const historyHtml = mySessions.length ? `
-    <div class="session-history">
-      ${mySessions.map((s,i)=>`
-        <div class="session-row">
-          <span>Session ${i+1}</span>
-          <span>${fmtTime(s.checkinTs)} → ${s.checkoutTs ? fmtTime(s.checkoutTs) : 'still in'}</span>
-        </div>`).join('')}
-    </div>` : '';
-
-  if(currentlyIn){
-    box.innerHTML = `<div class="panel" style="padding:16px 22px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <div><h3 style="margin:0;">✅ Checked in</h3><p class="sub" style="margin:4px 0 0;">at ${fmtTime(last.checkinTs)} as ${esc(session.name)}</p></div>
-        <button class="btn btn-outline-danger" id="doCheckoutBtn">Check Out</button>
-      </div>
-      ${historyHtml}
-    </div>`;
-    document.getElementById('doCheckoutBtn').onclick = (e) => handleCheckoutClick(e.currentTarget);
-  } else if(mySessions.length){
-    box.innerHTML = `<div class="panel" style="padding:16px 22px;">
-      <div style="display:flex;justify-content:space-between;align-items:center;">
-        <div><h3 style="margin:0;">Checked out</h3><p class="sub" style="margin:4px 0 0;">Last session: ${fmtTime(last.checkinTs)} → ${fmtTime(last.checkoutTs)}</p></div>
-        <button class="btn btn-primary" id="doCheckinBtn">Check In Again</button>
-      </div>
-      ${historyHtml}
-    </div>`;
-    document.getElementById('doCheckinBtn').onclick = (e) => handleCheckinClick(e.currentTarget);
+async function clearData() {
+  if (hasMongoConnection()) {
+    await Attendance.deleteMany({});
+    await HourlyUpdate.deleteMany({});
+    await InventoryReport.deleteMany({});
+    await EodReport.deleteMany({});
   } else {
-    box.innerHTML = `<div class="panel" style="display:flex;justify-content:space-between;align-items:center;padding:16px 22px;">
-      <div><h3 style="margin:0;">You haven't checked in yet</h3><p class="sub" style="margin:4px 0 0;">Tap the button to mark your arrival.</p></div>
-      <button class="btn btn-primary" id="doCheckinBtn">Check In Now</button>
-    </div>`;
-    document.getElementById('doCheckinBtn').onclick = (e) => handleCheckinClick(e.currentTarget);
+    memoryAttendance = [];
+    memoryHourlyUpdates = [];
+    memoryInventoryReports = [];
+    memoryEodReports = [];
   }
 }
 
-/* ============================= PROMOTER: TABS ============================= */
-document.querySelectorAll('.tab-btn').forEach(btn=>{
-  if(btn.closest('#mgrTabs')) return;
-  btn.onclick = ()=>{
-    document.querySelectorAll('.tabs:not(#mgrTabs) .tab-btn').forEach(b=>b.classList.remove('active'));
-    btn.classList.add('active');
-    currentTab = btn.dataset.tab;
-    document.querySelectorAll('.tab-panel').forEach(p=>p.classList.add('hidden'));
-    document.getElementById('tab-'+currentTab).classList.remove('hidden');
-    if(currentTab==='log') renderMyLog();
+// ============================= UTILS =============================
+function todayStr() {
+  const d = new Date();
+  return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
+
+async function compileLocationState(locationName, clientDate) {
+  const today = clientDate || todayStr();
+  const attendance = await getAttendance({ location: locationName });
+  const hourlyUpdates = await getHourlyUpdates({ location: locationName });
+  const inventoryReports = await getInventoryReports({ location: locationName });
+  const eodReports = await getEodReports({ location: locationName });
+
+  const todayAttendance = attendance.filter(a => a.date === today);
+  todayAttendance.sort((a, b) => b.checkinTs - a.checkinTs);
+  const latestAttendance = todayAttendance[0];
+
+  const checkin = latestAttendance ? {
+    name: latestAttendance.name,
+    ts: latestAttendance.checkinTs,
+    date: latestAttendance.date,
+    checkedOutTs: latestAttendance.checkoutTs
+  } : null;
+
+  const eod = eodReports.find(e => e.date === today) || null;
+
+  return {
+    checkin,
+    attendance,
+    hourlyUpdates,
+    inventoryReports,
+    eod
   };
+}
+
+// ============================= JWT MIDDLEWARE =============================
+function authenticateToken(req, res, next) {
+  const token = req.headers['x-auth-token'];
+  if (!token) {
+    return res.status(401).json({ error: 'Unauthorized. Token missing.' });
+  }
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Forbidden. Invalid token.' });
+    }
+    req.user = user;
+    next();
+  });
+}
+
+// ============================= API ENDPOINTS =============================
+
+// Login
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body;
+  try {
+    const admin = await findAdmin(username);
+    if (admin && verifyPassword(password, admin.password)) {
+      const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '24h' });
+      return res.json({ token, username });
+    }
+  } catch (err) {
+    console.error('Error querying admin from database:', err);
+  }
+
+  if (username === MANAGER_USERNAME && password === MANAGER_PASSWORD) {
+    const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '24h' });
+    res.json({ token, username });
+  } else {
+    res.status(401).json({ error: 'Invalid username or password.' });
+  }
 });
 
-function setLow(val){
-  hourlyLow = val;
-  document.getElementById('h_lowYes').className = val ? 'selected-yes' : '';
-  document.getElementById('h_lowNo').className = !val ? 'selected-no' : '';
-}
-function setInvLow(val){
-  invLow = val;
-  document.getElementById('i_lowYes').className = val ? 'selected-yes' : '';
-  document.getElementById('i_lowNo').className = !val ? 'selected-no' : '';
-}
+// Logout (success stub)
+app.post('/api/logout', (req, res) => {
+  res.json({ success: true });
+});
 
-function renderStockRows(n){
-  const wrap = document.getElementById('stockRows');
-  wrap.innerHTML='';
-  for(let i=0;i<n;i++) addStockRow();
-}
-function addStockRow(prefillName){
-  const wrap = document.getElementById('stockRows');
-  const row = document.createElement('div');
-  row.className='stock-row';
-  row.innerHTML = `<input type="text" placeholder="Item / flavour name" class="stock-item" list="presetItems">
-    <input type="number" min="0" placeholder="Qty" class="stock-qty">
-    <button type="button" class="icon-btn" onclick="this.closest('.stock-row').remove()">✕</button>`;
-  wrap.appendChild(row);
-  if(prefillName){
-    row.querySelector('.stock-item').value = prefillName;
-    row.querySelector('.stock-qty').focus();
+// Get Locations (strings)
+app.get('/api/locations', async (req, res) => {
+  try {
+    const locations = await getLocations();
+    res.json(locations.map(l => l.name));
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to retrieve locations.' });
   }
-}
-document.getElementById('addStockRowBtn').onclick = ()=>addStockRow();
+});
 
-function renderItemsSoldRows(n){
-  const wrap = document.getElementById('itemsSoldRows');
-  wrap.innerHTML='';
-  for(let i=0;i<n;i++) addItemSoldRow();
-}
-function addItemSoldRow(prefillName){
-  const wrap = document.getElementById('itemsSoldRows');
-  const row = document.createElement('div');
-  row.className='stock-row';
-  row.innerHTML = `<input type="text" placeholder="Item / flavour name" class="itemsold-item" list="presetItems">
-    <input type="number" min="0" placeholder="Qty sold" class="itemsold-qty">
-    <button type="button" class="icon-btn" onclick="this.closest('.stock-row').remove()">✕</button>`;
-  wrap.appendChild(row);
-  if(prefillName){
-    row.querySelector('.itemsold-item').value = prefillName;
-    row.querySelector('.itemsold-qty').focus();
+// Add Location
+app.post('/api/locations', async (req, res) => {
+  const { name, postcode } = req.body;
+  if (!name) {
+    return res.status(400).json({ error: 'Location name is required.' });
   }
-  return row;
-}
-document.getElementById('addItemSoldRowBtn').onclick = ()=>addItemSoldRow();
-
-function quickAddItemSold(name){
-  const wrap = document.getElementById('itemsSoldRows');
-  const rows = Array.from(wrap.querySelectorAll('.stock-row'));
-  const emptyRow = rows.find(r => !r.querySelector('.itemsold-item').value.trim());
-  if(emptyRow){
-    emptyRow.querySelector('.itemsold-item').value = name;
-    emptyRow.querySelector('.itemsold-qty').focus();
-  } else {
-    addItemSoldRow(name);
+  try {
+    const result = await addLocation(name.trim(), (postcode || '').trim());
+    res.json(result);
+  } catch (err) {
+    if (err.code === 11000) {
+      res.status(400).json({ error: 'Location already exists.' });
+    } else {
+      res.status(500).json({ error: 'Failed to add location.' });
+    }
   }
-}
+});
 
-/* ============================= PROMOTER: SUBMIT HOURLY ============================= */
-document.getElementById('submitHourlyBtn').onclick = async (e)=>{
-  const btn = e.currentTarget;
-  if(btn.disabled) return; // prevents double-tap double-submit -> duplicate sales rows
-  btn.disabled = true;
-  const originalText = btn.textContent;
-  btn.textContent = 'Submitting...';
-  try{
-    const itemsSold = Array.from(document.querySelectorAll('#itemsSoldRows .stock-row')).map(r=>({
-      item: r.querySelector('.itemsold-item').value,
-      qty: r.querySelector('.itemsold-qty').value
-    })).filter(r=>r.item.trim());
-    const payload = {
-      location: session.location, promoter: session.name,
-      footfall: document.getElementById('h_footfall').value || 0,
-      activity: document.getElementById('h_activity').value,
-      itemsSold,
-      lowStock: !!hourlyLow,
-      issues: document.getElementById('h_issues').value,
-      comments: document.getElementById('h_comments').value
-    };
-    await api('/hourly', { method:'POST', body: JSON.stringify(payload) });
-    showToast('Hourly update submitted');
-    ['h_footfall','h_activity','h_issues','h_comments'].forEach(id=>document.getElementById(id).value='');
-    renderItemsSoldRows(1);
-    hourlyLow=null; document.getElementById('h_lowYes').className=''; document.getElementById('h_lowNo').className='';
-    renderMyLog();
-  } finally {
-    btn.disabled = false;
-    btn.textContent = originalText;
+// Check-in
+app.post('/api/checkin', async (req, res) => {
+  const { location, name, date } = req.body;
+  if (!location || !name) {
+    return res.status(400).json({ error: 'Location and name are required.' });
   }
-};
-
-/* ============================= PROMOTER: SUBMIT INVENTORY ============================= */
-document.getElementById('submitInventoryBtn').onclick = async (e)=>{
-  const btn = e.currentTarget;
-  if(btn.disabled) return;
-  btn.disabled = true;
-  const originalText = btn.textContent;
-  btn.textContent = 'Submitting...';
-  try{
-    const rows = Array.from(document.querySelectorAll('#stockRows .stock-row')).map(r=>({
-      item: r.querySelector('.stock-item').value,
-      qty: r.querySelector('.stock-qty').value
-    })).filter(r=>r.item.trim());
-    const payload = {
-      location: session.location, promoter: session.name,
-      stock: rows,
-      missing: document.getElementById('i_missing').value,
-      oos: document.getElementById('i_oos').value,
-      lowStockAlert: !!invLow
-    };
-    await api('/inventory', { method:'POST', body: JSON.stringify(payload) });
-    showToast('Inventory report submitted');
-    document.getElementById('i_missing').value=''; document.getElementById('i_oos').value='';
-    renderStockRows(1);
-    invLow=null; document.getElementById('i_lowYes').className=''; document.getElementById('i_lowNo').className='';
-    renderMyLog();
-  } finally {
-    btn.disabled = false;
-    btn.textContent = originalText;
+  try {
+    const now = Date.now();
+    const today = date || todayStr();
+    await addAttendance({
+      location,
+      name,
+      checkinTs: now,
+      checkoutTs: null,
+      date: today
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to check in.' });
   }
-};
+});
 
-/* ============================= PROMOTER: SUBMIT EOD ============================= */
-document.getElementById('submitEodBtn').onclick = async (e)=>{
-  const btn = e.currentTarget;
-  if(btn.disabled) return;
-  btn.disabled = true;
-  const originalText = btn.textContent;
-  btn.textContent = 'Submitting...';
-  try{
-    const payload = {
-      location: session.location, promoter: session.name,
-      date: todayStr(),
-      sales: document.getElementById('e_sales').value || 0,
-      samples: document.getElementById('e_samples').value || 0,
-      inventory: document.getElementById('e_inventory').value,
-      flavours: document.getElementById('e_flavours').value,
-      summary: document.getElementById('e_summary').value,
-      feedback: document.getElementById('e_feedback').value
-    };
-    await api('/eod', { method:'POST', body: JSON.stringify(payload) });
-    showToast('End of Day report submitted');
-    renderMyLog();
-  } finally {
-    btn.disabled = false;
-    btn.textContent = originalText;
+// Check-out
+app.post('/api/checkout', async (req, res) => {
+  const { location, name } = req.body;
+  if (!location || !name) {
+    return res.status(400).json({ error: 'Location and name are required.' });
   }
-};
+  try {
+    const now = Date.now();
+    await updateAttendance(
+      { location, name, checkoutTs: null },
+      { checkoutTs: now }
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to check out.' });
+  }
+});
 
-/* ============================= PROMOTER: MY LOG ============================= */
-async function renderMyLog(){
-  if(!session) return;
-  const state = await getPromoterState(session.location);
-  const d = state.data;
-  const items = [];
-  (d.attendance||[]).filter(a=>a.date===todayStr() && a.name===session.name).forEach(a=>{
-    items.push({type:'Check-in', ts:a.checkinTs});
-    if(a.checkoutTs) items.push({type:'Check-out', ts:a.checkoutTs});
+// Hourly Update
+app.post('/api/hourly', async (req, res) => {
+  const { location, promoter, footfall, activity, itemsSold, lowStock, issues, comments } = req.body;
+  if (!location || !promoter) {
+    return res.status(400).json({ error: 'Location and promoter are required.' });
+  }
+  try {
+    await addHourlyUpdate({
+      location,
+      promoter,
+      ts: Date.now(),
+      footfall: Number(footfall) || 0,
+      activity: activity || '',
+      itemsSold: itemsSold || [],
+      lowStock: !!lowStock,
+      issues: issues || '',
+      comments: comments || ''
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to submit hourly update.' });
+  }
+});
+
+// Inventory Report
+app.post('/api/inventory', async (req, res) => {
+  const { location, promoter, stock, missing, oos, lowStockAlert } = req.body;
+  if (!location || !promoter) {
+    return res.status(400).json({ error: 'Location and promoter are required.' });
+  }
+  try {
+    await addInventoryReport({
+      location,
+      promoter,
+      ts: Date.now(),
+      stock: stock || [],
+      missing: missing || '',
+      oos: oos || '',
+      lowStockAlert: !!lowStockAlert
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to submit inventory report.' });
+  }
+});
+
+// End of Day (EOD)
+app.post('/api/eod', async (req, res) => {
+  const { location, promoter, sales, samples, inventory, flavours, summary, feedback, date } = req.body;
+  if (!location || !promoter) {
+    return res.status(400).json({ error: 'Location and promoter are required.' });
+  }
+  try {
+    const today = date || todayStr();
+    await saveEodReport(
+      { location, promoter, date: today },
+      {
+        location,
+        promoter,
+        date: today,
+        ts: Date.now(),
+        sales: Number(sales) || 0,
+        samples: Number(samples) || 0,
+        inventory: inventory || '',
+        flavours: flavours || '',
+        summary: summary || '',
+        feedback: feedback || ''
+      }
+    );
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to submit end of day report.' });
+  }
+});
+
+// Clear/Reset Demo Data (Protected)
+app.post('/api/reset', authenticateToken, async (req, res) => {
+  try {
+    await clearData();
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to reset demo data.' });
+  }
+});
+
+// Manager Dashboard State (Protected)
+app.get('/api/state', authenticateToken, async (req, res) => {
+  try {
+    const locations = await getLocations();
+    const postcodes = {};
+    const data = {};
+    const clientDate = req.query.today;
+
+    for (let loc of locations) {
+      postcodes[loc.name] = loc.postcode || '';
+      data[loc.name] = await compileLocationState(loc.name, clientDate);
+    }
+
+    res.json({
+      locations: locations.map(l => l.name),
+      postcodes,
+      data
+    });
+  } catch (err) {
+    console.error('Error fetching manager state:', err);
+    res.status(500).json({ error: 'Failed to load manager dashboard state.' });
+  }
+});
+
+// Promoter Portal State
+app.get('/api/promoter-state', async (req, res) => {
+  const { location, today } = req.query;
+  if (!location) {
+    return res.status(400).json({ error: 'Location query parameter is required.' });
+  }
+  try {
+    const data = await compileLocationState(location, today);
+    res.json({ data });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to load promoter state.' });
+  }
+});
+
+// ============================= LOCAL STATIC FILE SERVING =============================
+// Serve static client files when running standalone Express
+app.use(express.static(path.join(__dirname, '../public')));
+
+// Catch-all to serve frontend index.html for unknown routes (excluding /api)
+app.get('*', (req, res, next) => {
+  if (req.path.startsWith('/api')) {
+    return next();
+  }
+  res.sendFile(path.join(__dirname, '../public/index.html'));
+});
+
+// Standalone Server Startup (only if not running on Vercel as serverless)
+if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+  app.listen(PORT, '127.0.0.1', () => {
+    console.log(`Server is running locally at http://127.0.0.1:${PORT}`);
   });
-  (d.hourlyUpdates||[]).filter(u=>isToday(u.ts) && u.promoter===session.name).forEach(u=>items.push({type:'Hourly Update', ts:u.ts}));
-  (d.inventoryReports||[]).filter(u=>isToday(u.ts) && u.promoter===session.name).forEach(u=>items.push({type:'Inventory Report', ts:u.ts}));
-  if(d.eod && d.eod.date===todayStr() && d.eod.promoter===session.name) items.push({type:'End of Day Report', ts:d.eod.ts});
-  items.sort((a,b)=>b.ts-a.ts);
-  document.getElementById('myLog').innerHTML = items.length ? items.map(i=>`
-    <div class="log-item"><span class="l-type">${i.type}</span><span class="l-time">${fmtTime(i.ts)}</span></div>
-  `).join('') : '<p class="empty-note">Nothing submitted yet today.</p>';
 }
 
-/* ============================= INIT ============================= */
-(async function init(){
-  renderManager();
-  setInterval(()=>{ if(!document.getElementById('managerView').classList.contains('hidden') && authToken) renderManager(); }, 6000);
-})();
+// Export the app for Vercel Serverless Function entry
+module.exports = app;
