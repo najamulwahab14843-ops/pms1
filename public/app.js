@@ -462,22 +462,21 @@ async function openLocationDetail(loc){
 }
 
 /* ============================= PROMOTER: SETUP ============================= */
-async function populateLocationSelect(){
-  const locations = await api('/locations');
-  const sel = document.getElementById('setupLocation');
-  sel.innerHTML = locations.length
-    ? locations.map(l=>`<option value="${esc(l)}">${esc(l)}</option>`).join('')
-    : `<option value="">— No locations yet, add one below —</option>`;
-}
 document.getElementById('startShiftBtn').onclick = async ()=>{
   const name = document.getElementById('setupName').value.trim();
-  const newLoc = document.getElementById('setupNewLocation').value.trim();
-  const newPostcode = document.getElementById('setupPostcode').value.trim();
-  let loc = newLoc || document.getElementById('setupLocation').value;
+  const loc = document.getElementById('setupNewLocation').value.trim();
+  const postcode = document.getElementById('setupPostcode').value.trim();
   if(!name){ alert('Please enter your name.'); return; }
-  if(!loc){ alert('Please select or enter a location.'); return; }
-  if(newLoc){
-    await api('/locations', { method:'POST', body: JSON.stringify({ name: newLoc, postcode: newPostcode }) });
+  if(!loc){ alert('Please enter a location.'); return; }
+  try{
+    await api('/locations', { method:'POST', body: JSON.stringify({ name: loc, postcode }) });
+  }catch(e){
+    // If the location already exists, that's fine — just continue the shift.
+    // Any other error should stop and inform the promoter.
+    if(!String(e.message||'').toLowerCase().includes('already exists')){
+      alert('Could not save location: ' + (e.message || 'unknown error'));
+      return;
+    }
   }
   session = { name, location: loc };
   document.getElementById('promoterSetup').classList.add('hidden');
@@ -765,7 +764,6 @@ async function renderMyLog(){
 
 /* ============================= INIT ============================= */
 (async function init(){
-  await populateLocationSelect();
   renderManager();
   setInterval(()=>{ if(!document.getElementById('managerView').classList.contains('hidden') && authToken) renderManager(); }, 6000);
 })();
